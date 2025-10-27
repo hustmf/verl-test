@@ -2,8 +2,6 @@ set -x
 
 echo ">>Starting script at: $(date), path = $(pwd)"
 
-NPU_PER_NODE=${NPU_PER_NODE:-8}
-
 project_name='dpsk_v3_base_zero'
 exp_name='DAPO-DeepSeek-671b-megatron-4NNODES'
 

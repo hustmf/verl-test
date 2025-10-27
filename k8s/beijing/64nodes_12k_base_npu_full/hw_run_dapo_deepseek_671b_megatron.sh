@@ -2,10 +2,6 @@ set -x
 
 echo ">>Starting script at: $(date), path = $(pwd)"
 
-NNODES=${NNODES:-1}
-export NNODES=16
-NPU_PER_NODE=${NPU_PER_NODE:-8}
-cd /afs/chatrl/users/lyy/npu/verl
 project_name='dpsk_v3_base_zero'
 exp_name='DAPO-DeepSeek-671b-megatron-4NNODES'
 
