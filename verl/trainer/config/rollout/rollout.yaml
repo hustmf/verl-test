@@ -49,6 +49,9 @@ free_cache_engine: True
 # TP size for rollout. Not effective for hf
 tensor_model_parallel_size: 2
 
+# DP for rollout
+dp_model_parallel_size: 1
+
 # DP size for rollout
 data_parallel_size: 1
 
@@ -265,7 +268,7 @@ skip_dump_dir: /tmp/rollout_dump
 # When enabled (True), the rollout assume token in token out for generation
 skip_tokenizer_init: True
 
-# profile the rollout model in `generate_sequence` 
+# profile the rollout model in `generate_sequence`
 profiler:
 
   # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
