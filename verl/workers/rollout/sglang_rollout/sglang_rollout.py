@@ -424,7 +424,7 @@ class SGLangRollout(BaseRollout):
         node_rank = self._tp_rank // tp_size_per_node
         first_rank_in_node = self._tp_rank % tp_size_per_node == 0
         engine_kwargs = self.config.get("engine_kwargs", {}).get("sglang", {}) or {}
-        engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
+        #engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
 
         # attention backend will be changed to fa3 if not specified
         attention_backend = engine_kwargs.pop("attention_backend", None)
@@ -459,7 +459,7 @@ class SGLangRollout(BaseRollout):
                 # NOTE(linjunrong): add rank to prevent SGLang generate same port inside PortArgs.init_new
                 # when random.seed is being set during training
                 "port": sglang_port,
-                "nccl_port": sglang_port + 1,
+                #"nccl_port": sglang_port + 1,
                 # NOTE(Chenyang): if you want to debug the SGLang engine output
                 # please set the following parameters
                 # Otherwise, it will make the engine run too slow
@@ -474,6 +474,7 @@ class SGLangRollout(BaseRollout):
                 # In async mode, we want token in token out.
                 "skip_tokenizer_init": self.config.skip_tokenizer_init,
                 "dist_timeout": 1800,
+                **engine_kwargs,
             }
 
             if is_server_mode:
@@ -772,7 +773,6 @@ class SGLangRollout(BaseRollout):
                 rollout_log_probs = pad_sequence_to_length(
                     rollout_log_probs, self.config.response_length, self.pad_token_id
                 )
-
         seq = torch.cat([idx, response], dim=-1)
 
         response_length = response.size(1)
