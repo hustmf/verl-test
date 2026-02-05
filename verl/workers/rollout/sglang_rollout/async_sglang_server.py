@@ -471,7 +471,9 @@ class SGLangHttpServer:
                 routed_experts = extract_routed_experts_from_meta_info(output).reshape(
                     -1, hf_config.num_hidden_layers, hf_config.num_experts_per_tok
                 )
-
+        from transformers import AutoModelForCausalLM, AutoModelForSequenceClassification, AutoTokenizer
+        tokenizer_02 = AutoTokenizer.from_pretrained("/mnt/share/m00876805/ckpt/Qwen3-30B-MoE")
+        print(f"response={tokenizer_02.decode(token_ids)}")
         return TokenOutput(token_ids=token_ids, log_probs=log_probs, routed_experts=routed_experts)
 
     async def start_profile(self, **kwargs):

@@ -21,11 +21,11 @@ from verl.base_config import BaseConfig
 from verl.trainer.config import CheckpointConfig
 from verl.utils.profiler.config import ProfilerConfig
 
-from .engine import FSDPEngineConfig, McoreEngineConfig
+from .engine import FSDPEngineConfig, McoreEngineConfig, MindSpeedLLMEngineConfig
 from .model import HFModelConfig
 from .optimizer import OptimizerConfig
 
-__all__ = ["PolicyLossConfig", "RouterReplayConfig", "ActorConfig", "FSDPActorConfig", "McoreActorConfig"]
+__all__ = ["PolicyLossConfig", "RouterReplayConfig", "ActorConfig", "FSDPActorConfig", "McoreActorConfig", "MindSpeedLLMActorConfig"]
 
 
 @dataclass
@@ -306,3 +306,28 @@ class FSDPActorConfig(ActorConfig):
                 raise ValueError(
                     "When using sequence parallelism for actor/ref policy, you must enable `use_remove_padding`."
                 )
+
+
+@dataclass
+class MindSpeedLLMActorConfig(ActorConfig):
+    """Configuration for mindspeedllm actor models.
+
+    The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
+
+    Args:
+        strategy (str): Training strategy set to 'mindspeedllm' for mindspeedllm parallelism.
+        load_weight (bool): Whether to load model weights from checkpoint.
+        mindspeedllm (dict[str, Any]): Configuration for mindspeedllm parallelism settings.
+        profile (dict[str, Any]): Configuration for profiling settings.
+    """
+
+    strategy: str = "mindspeedllm"
+    load_weight: bool = True
+    mindspeedllm: MindSpeedLLMEngineConfig = field(default_factory=MindSpeedLLMEngineConfig)
+    profile: dict[str, Any] = field(default_factory=dict)
+    use_rollout_log_probs: bool = False
+
+    def __post_init__(self):
+        """Validate FSDP actor configuration parameters."""
+        super().__post_init__()
+        self.engine = self.mindspeedllm

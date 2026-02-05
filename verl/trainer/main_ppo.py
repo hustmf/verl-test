@@ -187,7 +187,14 @@ class TaskRunner:
         elif config.critic.strategy == "megatron":
             # TODO: switch this to TrainingWorker as well
             from verl.workers.megatron_workers import CriticWorker
+        elif config.critic.strategy == "mindspeedllm":
+            if use_legacy_worker_impl == "disable":
+                from verl.workers.engine_workers import TrainingWorker
 
+                CriticWorker = TrainingWorker
+                print("Using new worker implementation")
+            else:
+                raise ValueError(f"Invalid use_legacy_worker_impl: {use_legacy_worker_impl}")
         else:
             raise NotImplementedError
 

@@ -21,26 +21,37 @@ __all__ = [
     "FSDPEngineWithLMHead",
 ]
 
-try:
-    from .veomni import VeOmniEngine, VeOmniEngineWithLMHead
+import os
+engine_backend = os.environ.get('engine_backend')
+if engine_backend=="veomni":
+    try:
+        from .veomni import VeOmniEngine, VeOmniEngineWithLMHead
 
-    __all__ += ["VeOmniEngine", "VeOmniEngineWithLMHead"]
-except ImportError:
-    VeOmniEngine = None
-    VeOmniEngineWithLMHead = None
+        __all__ += ["VeOmniEngine", "VeOmniEngineWithLMHead"]
+    except ImportError:
+        VeOmniEngine = None
+        VeOmniEngineWithLMHead = None
 
-# Mindspeed must be imported before Megatron to ensure the related monkey patches take effect as expected
-try:
-    from .mindspeed import MindspeedEngineWithLMHead
+elif engine_backend=="mindspeedllm":
+    try:
+        from .mindspeedllm import MindspeedLLMEngineWithLMHead
 
-    __all__ += ["MindspeedEngineWithLMHead"]
-except ImportError:
-    MindspeedEngineWithLMHead = None
+        __all__ += ["MindspeedLLMEngineWithLMHead"]
+    except ImportError:
+        MindspeedLLMEngineWithLMHead = None
+elif engine_backend=="mindspeed":
+    # Mindspeed must be imported before Megatron to ensure the related monkey patches take effect as expected
+    try:
+        from .mindspeed import MindspeedEngineWithLMHead
 
-try:
-    from .megatron import MegatronEngine, MegatronEngineWithLMHead
+        __all__ += ["MindspeedEngineWithLMHead"]
+    except ImportError:
+        MindspeedEngineWithLMHead = None
+elif engine_backend=="megatron":
+    try:
+        from .megatron import MegatronEngine, MegatronEngineWithLMHead
 
-    __all__ += ["MegatronEngine", "MegatronEngineWithLMHead"]
-except ImportError:
-    MegatronEngine = None
-    MegatronEngineWithLMHead = None
+        __all__ += ["MegatronEngine", "MegatronEngineWithLMHead"]
+    except ImportError:
+        MegatronEngine = None
+        MegatronEngineWithLMHead = None
