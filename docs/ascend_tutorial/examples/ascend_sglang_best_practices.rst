@@ -34,7 +34,7 @@ SGLang 是当前主流的高性能开源推理引擎, 昇腾已经全面原生�
 .. code-block:: bash
 
     cd verl
-    git checkout 772c224
+    git checkout c98cb8c
 模型训练与评估
 -----------------------------------
 1.模型数据准备
