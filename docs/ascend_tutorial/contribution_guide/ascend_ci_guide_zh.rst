@@ -1,11 +1,11 @@
 NPU-CI 添加指导
 ===========
 
-Last updated：02/02/2026.
+Last updated: 02/02/2026.
 
-我们在 verl 上增加基于华为昇腾设备的CI用例添加指导。
+我们在verl上提供基于华为昇腾设备的CI用例添加指导。
 
-verl 仓库使用 GitHub Actions 作为 CI 平台，通过分层测试架构保障代码质量与系统稳定性。
+verl仓库使用GitHub Actions作为CI平台，通过分层测试架构保障代码质量与系统稳定性。
 NPU 相关的工作流主要包括：
 
 * ``npu_unit_test.yml``：运行单元测试。
@@ -66,7 +66,7 @@ NPU 相关的工作流主要包括：
 
 **Note**
 
-   ${HOME}是root
+   ${HOME}环境变量对应root用户目录（/root）。
 
    gpu用例中权重在~/models/路径下，如需适配可以用软链接，``ln -s /root/.cache/models ~/models``
 
