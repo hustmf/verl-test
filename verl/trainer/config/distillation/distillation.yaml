@@ -84,6 +84,11 @@ teacher_models:
     key: null
     model_path: null
     num_replicas: 0
+    # Number of nodes a single teacher replica occupies. 0 = derived from the pool
+    # layout (min(n_gpus_per_node, per_replica_world_size) GPUs per node). On Ascend
+    # NPU clusters a replica must not span SuperPods (at most 48 nodes each), so this
+    # must be at most the number of teacher-pool nodes available within one SuperPod.
+    nnodes_per_replica: 0
     inference:
       _target_: verl.workers.config.RolloutConfig
       name: ${oc.select:actor_rollout_ref.rollout.name}

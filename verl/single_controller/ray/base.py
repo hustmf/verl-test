@@ -29,7 +29,7 @@ from verl.plugin.platform import get_platform
 from verl.protocol import DataProto, _padding_size_key
 from verl.single_controller.base import ClassWithInitArgs, ResourcePool, Worker, WorkerGroup
 from verl.single_controller.base.decorator import MAGIC_ATTR, Dispatch
-from verl.utils.device import get_device_name
+from verl.utils.device import get_device_name, get_superpod_id
 from verl.utils.py_functional import temp_env_var
 
 __all__ = ["Worker"]
@@ -67,6 +67,74 @@ def func_generator(self, method_name, dispatch_fn, collect_fn, execute_fn, block
     return type(method_name, (Functor,), {})()
 
 
+# Cache of probed SuperPod IDs per ray node ID; a node's SuperPod membership does
+# not change, so each node is probed at most once per driver process.
+_node_spod_id_cache: dict[str, int | None] = {}
+
+
+@ray.remote
+def _probe_superpod_id() -> int | None:
+    """Lightweight task pinned to a specific node to probe its Ascend SuperPod ID."""
+    return get_superpod_id()
+
+
+def _probe_nodes_superpod_ids(node_ids: list[str]) -> dict[str, int | None]:
+    """Probe the SuperPod ID of each given ray node.
+
+    Runs a lightweight task pinned to each node via a soft node-affinity scheduling
+    strategy. On non-NPU platforms nothing is probed and every node maps to None;
+    nodes whose probe fails also map to None (with a warning), which degrades
+    topology-aware placement to the plain node-IP order.
+    """
+    try:
+        is_npu = get_platform().device_name == "npu"
+    except Exception:
+        is_npu = False
+    if not is_npu:
+        return {node_id: None for node_id in node_ids}
+
+    pending = {}
+    for node_id in node_ids:
+        if node_id not in _node_spod_id_cache:
+            pending[node_id] = _probe_superpod_id.options(
+                scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=True)
+            ).remote()
+    for node_id, ref in pending.items():
+        try:
+            _node_spod_id_cache[node_id] = ray.get(ref)
+        except Exception as e:
+            logger.warning(f"Failed to probe SuperPod ID on ray node {node_id}: {e}")
+            _node_spod_id_cache[node_id] = None
+    return {node_id: _node_spod_id_cache[node_id] for node_id in node_ids}
+
+
+def sort_placement_groups_by_topology(pgs: list[PlacementGroup]) -> tuple[list[PlacementGroup], list[int | None]]:
+    """Sort the placement groups by (SuperPod ID, node IP) and report each PG's SuperPod ID.
+
+    Same rationale as `sort_placement_group_by_node_ip` (all bundles of a single placement
+    group should be on the same node), plus grouping by Ascend SuperPod so that nodes of
+    the same SuperPod are contiguous in the sorted order. PGs whose SuperPod ID could not
+    be probed (non-NPU platform or probe failure) sort last, which degrades to the plain
+    node-IP order.
+
+    Returns:
+        tuple: (sorted placement groups, SuperPod ID of each sorted placement group).
+    """
+    node_ip = {node["NodeID"]: node["NodeManagerAddress"] for node in ray.nodes()}
+    pg_ip = {}
+    pg_node_id = {}
+    for pg in pgs:
+        specs = ray._private.state.state.placement_group_table(pg.id)
+        # all bunles should be on the same node
+        node_id = specs["bundles_to_node_id"][0]
+        pg_node_id[pg.id] = node_id
+        pg_ip[pg.id] = node_ip[node_id]
+    node_spod_ids = _probe_nodes_superpod_ids(list({pg_node_id[pg.id] for pg in pgs}))
+    pg_spod_id = {pg.id: node_spod_ids[pg_node_id[pg.id]] for pg in pgs}
+    sorted_pgs = sorted(pgs, key=lambda pg: (pg_spod_id[pg.id] is None, pg_spod_id[pg.id] or 0, pg_ip[pg.id]))
+    return sorted_pgs, [pg_spod_id[pg.id] for pg in sorted_pgs]
+
+
 def sort_placement_group_by_node_ip(pgs: list[PlacementGroup]) -> list[PlacementGroup]:
     """
     Sort the placement groups by node ip, all bundles in a single placement group should be on the same node.
@@ -76,15 +144,12 @@ def sort_placement_group_by_node_ip(pgs: list[PlacementGroup]) -> list[Placement
 
     With this function, if there's only one resource pool and there's no node change, RANK should be consistent
     across nodes in multiple ray jobs, even if the whole ray cluster is restarted.
+
+    On Ascend NPU clusters the sort key is (SuperPod ID, node IP) so that ranks are
+    additionally grouped by SuperPod; see `sort_placement_groups_by_topology`.
     """
-    node_ip = {node["NodeID"]: node["NodeManagerAddress"] for node in ray.nodes()}
-    pg_ip = {}
-    for pg in pgs:
-        specs = ray._private.state.state.placement_group_table(pg.id)
-        # all bunles should be on the same node
-        node_id = specs["bundles_to_node_id"][0]
-        pg_ip[pg.id] = node_ip[node_id]
-    return sorted(pgs, key=lambda pg: pg_ip[pg.id])
+    sorted_pgs, _ = sort_placement_groups_by_topology(pgs)
+    return sorted_pgs
 
 
 @ray.remote
@@ -125,6 +190,9 @@ class RayResourcePool(ResourcePool):
         # print(f"in RayProcessDispatchConfiguration: name_prefix = {name_prefix}")
         self.name_prefix = get_random_string(length=6) if name_prefix is None else name_prefix
         self.pgs = None
+        # SuperPod ID of each sorted placement group in self.pgs (None when not probed,
+        # e.g. non-NPU platform). Populated by get_placement_groups.
+        self.pg_spod_ids: Optional[list[int | None]] = None
         self.detached = detached
         self.accelerator_type = accelerator_type
 
@@ -159,7 +227,7 @@ class RayResourcePool(ResourcePool):
 
         ray.get([pg.ready() for pg in pgs])
 
-        self.pgs = sort_placement_group_by_node_ip(pgs)
+        self.pgs, self.pg_spod_ids = sort_placement_groups_by_topology(pgs)
         return pgs
 
 
@@ -169,10 +237,12 @@ class SubRayResourcePool(RayResourcePool):
         placement_groups: list[PlacementGroup],
         start_bundle_index: int,
         subgroup_world_size: int,
+        pg_spod_ids: Optional[list[int | None]] = None,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         self.pgs = placement_groups
+        self.pg_spod_ids = pg_spod_ids
         self.start_bundle_index = start_bundle_index
         self.subgroup_world_size = subgroup_world_size
 
@@ -268,6 +338,30 @@ def extract_pg_from_exist(
     return [pg for _, pg in sorted(unsorted_pgs)]
 
 
+def _slice_pg_spod_ids(
+    resource_pool: RayResourcePool | SubRayResourcePool, start_bundle_index: int, world_size: int
+) -> list[int | None] | None:
+    """Return the SuperPod IDs of the placement groups spanned by a bundle range.
+
+    The range is [start_bundle_index, start_bundle_index + world_size) in units of the
+    pool's own per-PG bundle count (store[0]). Returns None when the pool has no SuperPod
+    information (non-NPU platform or probe failure).
+    """
+    pg_spod_ids = getattr(resource_pool, "pg_spod_ids", None)
+    if pg_spod_ids is None or world_size <= 0:
+        return None
+    bundles_per_pg = resource_pool.store[0]
+    base_pg = 0
+    if isinstance(resource_pool, SubRayResourcePool):
+        # A sub-pool's pg_spod_ids slice starts at the PG holding its first bundle.
+        base_pg = resource_pool.start_bundle_index // bundles_per_pg
+    first_pg = start_bundle_index // bundles_per_pg - base_pg
+    last_pg = (start_bundle_index + world_size - 1) // bundles_per_pg - base_pg
+    if first_pg < 0 or last_pg >= len(pg_spod_ids):
+        return None
+    return pg_spod_ids[first_pg : last_pg + 1]
+
+
 # split a RayResourcePool or SubRayResourcePool into multiple SubRayResourcePool
 def split_resource_pool(
     resource_pool: RayResourcePool | SubRayResourcePool, split_size: int | list[int]
@@ -312,10 +406,256 @@ def split_resource_pool(
             placement_groups=placement_groups,
             start_bundle_index=start_bundle_idx_list[split_idx],
             subgroup_world_size=split_size_list[split_idx],
+            pg_spod_ids=_slice_pg_spod_ids(resource_pool, start_bundle_idx_list[split_idx], split_size_list[split_idx]),
         )
         for split_idx in range(len(split_size_list))
     ]
     return split_resource_pools
+
+
+def split_resource_pool_spod_aligned(
+    resource_pool: RayResourcePool | SubRayResourcePool,
+    split_size: int | list[int],
+    gpus_per_replica_node: int | None = None,
+) -> list[SubRayResourcePool]:
+    """Split a resource pool into SubRayResourcePools that never span SuperPods.
+
+    On Ascend NPU clusters an inference replica must not span SuperPods (at most 48
+    nodes each). Placement groups are sorted by (SuperPod ID, node IP), so the PGs of
+    one SuperPod form a contiguous block. Each split (replica) is greedily packed into
+    a single block; when the remaining space of the current block cannot hold the next
+    replica, the remainder is left idle (fragmentation) and allocation continues at the
+    next block.
+
+    A replica larger than one node must occupy whole nodes (its size must be a multiple
+    of the per-node GPU count); a replica smaller than one node is kept inside a single
+    PG so it can never straddle a node (hence a SuperPod) boundary.
+
+    Args:
+        resource_pool (RayResourcePool | SubRayResourcePool): The resource pool to split.
+        split_size (int | list[int]): The size of each split in bundles (GPUs). If int,
+            all splits have the same size. ``sum(split_size)`` may be smaller than the
+            pool world size; the unallocated remainder stays idle.
+        gpus_per_replica_node (int | None): GPUs each replica occupies per node. Defaults
+            to the pool's per-PG bundle count (store[0]). When smaller, each replica is
+            spread over more PGs and the remaining bundles of those PGs stay idle.
+
+    Returns:
+        list[SubRayResourcePool]: A list of SubRayResourcePool after splitting.
+
+    Raises:
+        ValueError: If a replica cannot be node-aligned, or does not fit into any single
+            SuperPod block.
+    """
+    # convert split_size to list[int]
+    if isinstance(split_size, int):
+        assert resource_pool.world_size % split_size == 0, "split_size must be a divisor of world_size"
+        num_replica = resource_pool.world_size // split_size
+        split_size_list = [split_size] * num_replica
+    else:
+        split_size_list = split_size
+
+    if sum(split_size_list) > resource_pool.world_size:
+        raise ValueError(
+            f"split_size {split_size_list} sums up to {sum(split_size_list)}, which exceeds the "
+            f"resource pool world size {resource_pool.world_size}"
+        )
+
+    # ensure resource_pool.pgs has been initialized
+    device = get_device_name()
+    placement_groups = resource_pool.get_placement_groups(device_name=device)
+
+    store = resource_pool.store
+    bundles_per_pg = store[0]
+    start_bundle_index = resource_pool.start_bundle_index if isinstance(resource_pool, SubRayResourcePool) else 0
+    if start_bundle_index % bundles_per_pg != 0 or resource_pool.world_size % bundles_per_pg != 0:
+        # The pool region is not aligned to PG boundaries; keep the previous behavior.
+        logger.warning(
+            f"Resource pool {resource_pool.name_prefix!r} region (start_bundle_index={start_bundle_index}, "
+            f"world_size={resource_pool.world_size}, {bundles_per_pg} bundles per PG) is not aligned to "
+            "placement group boundaries; falling back to the flat topology-agnostic split."
+        )
+        return split_resource_pool(resource_pool, split_size)
+
+    gpus_per_node = gpus_per_replica_node if gpus_per_replica_node is not None else bundles_per_pg
+    if gpus_per_node <= 0 or gpus_per_node > bundles_per_pg:
+        raise ValueError(
+            f"gpus_per_replica_node ({gpus_per_node}) must be in [1, {bundles_per_pg}] (the pool's per-node GPU count)"
+        )
+
+    # This pool's region covers PGs [region_first_pg, region_first_pg + num_region_pgs)
+    # of the (shared) placement group list. The pool's pg_spod_ids slice starts at
+    # region_first_pg, see _slice_pg_spod_ids.
+    region_first_pg = start_bundle_index // bundles_per_pg
+    num_region_pgs = resource_pool.world_size // bundles_per_pg
+
+    # When gpus_per_node differs from the pool's per-PG bundle count, the sub-pools get
+    # a per-PG store of gpus_per_node so that colocated worker placement honors the
+    # replica node layout; the remaining bundles of each PG stay idle.
+    out_store = store if gpus_per_node == bundles_per_pg else [gpus_per_node] * len(store)
+
+    pg_spod_ids = getattr(resource_pool, "pg_spod_ids", None)
+    if pg_spod_ids is None or all(spod_id is None for spod_id in pg_spod_ids):
+        # Non-NPU platform or probe failure: flat topology-agnostic allocation.
+        region_spod_ids = None
+        local_start_list = list(np.cumsum([0] + split_size_list[:-1]))
+    elif len(pg_spod_ids) < num_region_pgs:
+        logger.warning(
+            f"Resource pool {resource_pool.name_prefix!r} has {len(pg_spod_ids)} SuperPod IDs for "
+            f"{num_region_pgs} placement groups; falling back to the flat topology-agnostic split."
+        )
+        region_spod_ids = None
+        local_start_list = list(np.cumsum([0] + split_size_list[:-1]))
+    else:
+        region_spod_ids = list(pg_spod_ids[:num_region_pgs])
+        local_start_list = _spod_aligned_block_fit(
+            region_spod_ids, split_size_list, gpus_per_node, resource_pool.name_prefix
+        )
+
+    # Convert region-local starts to global bundle indices.
+    split_resource_pools = [
+        SubRayResourcePool(
+            process_on_nodes=out_store,
+            use_gpu=resource_pool.use_gpu,
+            name_prefix=f"{resource_pool.name_prefix}_split_{split_idx}",
+            max_colocate_count=resource_pool.max_colocate_count,
+            placement_groups=placement_groups,
+            start_bundle_index=region_first_pg * gpus_per_node + int(local_start_list[split_idx]),
+            subgroup_world_size=split_size_list[split_idx],
+            pg_spod_ids=None
+            if region_spod_ids is None
+            else region_spod_ids[
+                local_start_list[split_idx] // gpus_per_node : (
+                    local_start_list[split_idx] + split_size_list[split_idx] - 1
+                )
+                // gpus_per_node
+                + 1
+            ],
+        )
+        for split_idx in range(len(split_size_list))
+    ]
+    return split_resource_pools
+
+
+def _spod_aligned_block_fit(
+    region_spod_ids: list[int | None], split_size_list: list[int], gpus_per_node: int, pool_name: str
+) -> list[int]:
+    """Greedily pack each split into a single SuperPod block; return region-local start bundles.
+
+    Blocks are consecutive runs of PGs sharing one SuperPod ID. When the remaining space
+    of the current block cannot hold the next replica, the remainder is left idle
+    (fragmentation) and allocation continues at the next block. A replica larger than
+    one node must occupy whole nodes; a smaller replica is kept inside a single PG.
+
+    Raises:
+        ValueError: If a replica cannot be node-aligned, or does not fit into any single
+            SuperPod block.
+    """
+    num_region_pgs = len(region_spod_ids)
+
+    # SuperPod blocks: (start_pg, end_pg), end exclusive, in region-local PG indices.
+    block_bounds = []
+    pg = 0
+    while pg < num_region_pgs:
+        block_end = pg + 1
+        while block_end < num_region_pgs and region_spod_ids[block_end] == region_spod_ids[pg]:
+            block_end += 1
+        block_bounds.append((pg, block_end))
+        pg = block_end
+
+    # cur_pg / cur_used: cursor (region-local PG index, used bundles within that PG).
+    cur_pg, cur_used, block_idx = 0, 0, 0
+    local_start_list = []
+    for size in split_size_list:
+        placed = False
+        while block_idx < len(block_bounds) and not placed:
+            block_start, block_end = block_bounds[block_idx]
+            if cur_pg < block_start:
+                cur_pg, cur_used = block_start, 0
+            if size <= gpus_per_node:
+                # Replica stays inside a single PG; skip PGs without enough room left.
+                while cur_pg < block_end and gpus_per_node - cur_used < size:
+                    cur_pg, cur_used = cur_pg + 1, 0
+                if cur_pg < block_end:
+                    local_start_list.append(cur_pg * gpus_per_node + cur_used)
+                    cur_used += size
+                    if cur_used == gpus_per_node:
+                        cur_pg, cur_used = cur_pg + 1, 0
+                    placed = True
+                else:
+                    block_idx += 1
+            else:
+                if size % gpus_per_node != 0:
+                    raise ValueError(
+                        f"Replica of {size} GPUs cannot be aligned to whole nodes with "
+                        f"{gpus_per_node} GPUs per node; adjust the replica's inference "
+                        f"parallelism (TP*DP*PP) or nnodes_per_replica."
+                    )
+                pgs_needed = size // gpus_per_node
+                if block_end - cur_pg >= pgs_needed:
+                    local_start_list.append(cur_pg * gpus_per_node)
+                    cur_pg += pgs_needed
+                    placed = True
+                else:
+                    # Skip the remaining space of this block (left idle).
+                    block_idx += 1
+        if not placed:
+            pgs_needed = (size + gpus_per_node - 1) // gpus_per_node
+            raise ValueError(
+                f"Cannot allocate a replica of {size} GPUs ({pgs_needed} node(s) at "
+                f"{gpus_per_node} GPUs/node) within a single SuperPod of pool "
+                f"{pool_name!r}: SuperPod blocks have "
+                f"{[end - start for start, end in block_bounds]} node(s) each. Reduce the "
+                f"replica's node count (adjust inference TP*DP*PP or nnodes_per_replica) "
+                f"so that it fits into one SuperPod block."
+            )
+    return local_start_list
+
+
+def validate_replicas_within_superpod(
+    pg_spod_ids: list[int | None] | None,
+    gpus_per_node: int,
+    replica_world_size: int,
+    error_hint: str = "",
+) -> None:
+    """Validate that contiguously slicing a pool into replicas keeps each replica in one SuperPod.
+
+    Simulates the flat rank slicing used by hybrid rollout replicas: replica i occupies
+    bundles [i * replica_world_size, (i + 1) * replica_world_size) of the pool sorted by
+    (SuperPod ID, node IP), and raises if the placement groups of any replica carry more
+    than one SuperPod ID.
+
+    Args:
+        pg_spod_ids (list[int | None] | None): SuperPod ID of each placement group of the
+            pool, aligned with the sorted PG order. No-op when None or all None (non-NPU
+            platform or probe failure).
+        gpus_per_node (int): Number of GPUs (bundles) per placement group.
+        replica_world_size (int): GPU count of a single replica (TP*DP*PP).
+        error_hint (str): Optional remediation advice appended to the error message.
+
+    Raises:
+        ValueError: If any replica's PG range spans multiple SuperPods.
+    """
+    if not pg_spod_ids or all(spod_id is None for spod_id in pg_spod_ids):
+        return
+    total_world_size = len(pg_spod_ids) * gpus_per_node
+    if total_world_size % replica_world_size != 0:
+        raise ValueError(
+            f"Pool world size {total_world_size} ({len(pg_spod_ids)} nodes x {gpus_per_node} GPUs) "
+            f"is not divisible by replica world size {replica_world_size}.{error_hint}"
+        )
+    num_replicas = total_world_size // replica_world_size
+    for replica_idx in range(num_replicas):
+        first_pg = replica_idx * replica_world_size // gpus_per_node
+        last_pg = ((replica_idx + 1) * replica_world_size - 1) // gpus_per_node
+        spod_ids = {pg_spod_ids[pg] for pg in range(first_pg, last_pg + 1) if pg_spod_ids[pg] is not None}
+        if len(spod_ids) > 1:
+            raise ValueError(
+                f"Replica {replica_idx} (bundles [{replica_idx * replica_world_size}, "
+                f"{(replica_idx + 1) * replica_world_size})) spans multiple SuperPods "
+                f"{sorted(spod_ids)}; an inference replica must stay within one SuperPod."
+                f"{error_hint}"
+            )
 
 
 def merge_resource_pool(rp1: RayResourcePool, rp2: RayResourcePool) -> RayResourcePool:

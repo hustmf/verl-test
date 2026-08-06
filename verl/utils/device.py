@@ -18,7 +18,9 @@ layer in :mod:`verl.plugin.platform`.
 import logging
 import os
 import platform
+import re
 import subprocess
+from functools import lru_cache
 
 import torch
 from packaging import version
@@ -264,6 +266,46 @@ def get_npu_versions() -> tuple[str, str]:
         raise RuntimeError("Could not find version in CANN toolkit info file")
 
     return software_version, cann_version
+
+
+@lru_cache
+def get_superpod_id() -> int | None:
+    """Get the SuperPod ID of the current Ascend NPU node.
+
+    On Ascend NPU clusters, nodes are grouped into SuperPods (at most 48 nodes
+    each). The SuperPod ID is parsed from the ``Super Pod ID :<n>`` line of
+    ``npu-smi info -t spod-info -i 0 -c 0``.
+
+    The result is cached for the process lifetime since the SuperPod
+    membership of a node does not change.
+
+    Returns:
+        int | None: The SuperPod ID, or None on non-NPU platforms or when the
+        query/parsing fails.
+    """
+    try:
+        if get_platform().device_name != "npu":
+            return None
+    except Exception:
+        return None
+
+    try:
+        result = subprocess.run(
+            ["npu-smi", "info", "-t", "spod-info", "-i", "0", "-c", "0"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, OSError) as e:
+        logger.warning(f"Failed to query SuperPod info via npu-smi: {e}")
+        return None
+
+    # Extract the SuperPod ID from a line like: "Super Pod ID : 1"
+    match = re.search(r"Super Pod ID\s*:\s*(\d+)", result.stdout)
+    if match is None:
+        logger.warning(f"Could not find Super Pod ID in npu-smi output:\n{result.stdout}")
+        return None
+    return int(match.group(1))
 
 
 def check_ipc_version_support(software_version: str, cann_version: str) -> bool:

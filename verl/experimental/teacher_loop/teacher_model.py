@@ -18,7 +18,7 @@ import os
 
 from omegaconf import DictConfig, OmegaConf
 
-from verl.single_controller.ray.base import RayResourcePool, split_resource_pool
+from verl.single_controller.ray.base import RayResourcePool, split_resource_pool, split_resource_pool_spod_aligned
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.ray_utils import auto_await
 from verl.workers.config import DistillationConfig, DistillationTeacherModelConfig
@@ -73,6 +73,10 @@ class TeacherModelManager:
             )
 
         gpus_per_node = self.distillation_config.n_gpus_per_node
+        # Explicit replica node count (0 = derived from the pool layout). When set, each
+        # replica spans nnodes_per_replica nodes with gpus_per_replica_node GPUs per node.
+        nnodes_per_replica = teacher_model_config.nnodes_per_replica
+        gpus_per_replica_node = per_replica_world_size // nnodes_per_replica if nnodes_per_replica > 0 else None
         rollout_replica_class = get_rollout_replica_class(teacher_model_config.inference.name)
         rollout_config = teacher_model_config.inference
         # Keep the model path unresolved until the rollout server actor is
@@ -94,12 +98,19 @@ class TeacherModelManager:
                 gpus_per_node=gpus_per_node,
                 is_teacher_model=True,
                 name_suffix=name_suffix,
+                gpus_per_replica_node=gpus_per_replica_node,
             )
             for replica_rank in range(num_replicas)
         ]
-        split_resource_pools = split_resource_pool(self.resource_pool, split_size=per_replica_world_size)
+        split_resource_pools = split_resource_pool_spod_aligned(
+            self.resource_pool,
+            split_size=per_replica_world_size,
+            gpus_per_replica_node=gpus_per_replica_node,
+        )
         assert len(split_resource_pools) == len(self.rollout_replicas)
-        self._validate_replica_node_alignment(split_resource_pools, per_replica_world_size, gpus_per_node)
+        self._validate_replica_node_alignment(
+            split_resource_pools, per_replica_world_size, gpus_per_replica_node or gpus_per_node
+        )
         _run_all(
             [
                 server.init_colocated(resource_pool)
@@ -151,6 +162,18 @@ class TeacherModelManager:
                     f"adjust num_replicas / inference parallelism so each replica sub-pool "
                     f"aligns to node boundaries."
                 )
+            # Hard SuperPod check: a replica must never span SuperPods, even if the
+            # allocation logic above misbehaves.
+            spod_ids = getattr(sub_pool, "pg_spod_ids", None)
+            if spod_ids:
+                unique_spod_ids = {spod_id for spod_id in spod_ids if spod_id is not None}
+                if len(unique_spod_ids) > 1:
+                    raise ValueError(
+                        f"Teacher {key!r} replica {i} sub-pool bundles [{start}, {start + W}) "
+                        f"span multiple SuperPods {sorted(unique_spod_ids)}; an inference replica "
+                        f"must stay within one SuperPod. Adjust nnodes_per_replica / inference "
+                        f"parallelism, or align distillation.nnodes to SuperPod boundaries."
+                    )
 
     def _initialize_load_balancer_handle(self):
         from verl.workers.rollout.llm_server import GlobalRequestLoadBalancer

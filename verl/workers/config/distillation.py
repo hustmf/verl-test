@@ -140,6 +140,13 @@ class DistillationTeacherModelConfig(BaseConfig):
         inference.tensor_model_parallel_size * inference.pipeline_model_parallel_size),
         so the teacher's total GPU footprint is
         `num_replicas * per_replica_world_size`.
+    nnodes_per_replica (int):
+        Number of nodes a single teacher replica occupies. 0 (default) keeps the
+        derived behavior (`min(n_gpus_per_node, per_replica_world_size)` GPUs per
+        node). When > 0, each replica spans exactly `nnodes_per_replica` nodes with
+        `per_replica_world_size // nnodes_per_replica` GPUs per node, which must not
+        exceed the pool's `n_gpus_per_node`. On Ascend NPU clusters this must be at
+        most the number of nodes available within one SuperPod (<= 48).
     """
 
     _mutable_fields = BaseConfig._mutable_fields | {"num_replicas", "key"}
@@ -148,6 +155,7 @@ class DistillationTeacherModelConfig(BaseConfig):
     model_path: Optional[str] = None
     inference: RolloutConfig = field(default_factory=RolloutConfig)
     num_replicas: Optional[int] = 0
+    nnodes_per_replica: int = 0
 
     @property
     def per_replica_world_size(self) -> int:
@@ -168,6 +176,30 @@ class DistillationTeacherModelConfig(BaseConfig):
             raise ValueError("key must be specified for distillation teacher model config.")
         if self.num_replicas is None:
             raise ValueError("num_replicas must be specified for distillation teacher model config.")
+
+    def validate_nnodes_per_replica(self, n_gpus_per_node: int) -> None:
+        """Validate nnodes_per_replica against the per-replica world size and the pool layout.
+
+        Args:
+            n_gpus_per_node: Number of GPUs per node in the teacher resource pool.
+        """
+        if self.nnodes_per_replica < 0:
+            raise ValueError(f"nnodes_per_replica must be >= 0, but got {self.nnodes_per_replica}.")
+        if self.nnodes_per_replica == 0:
+            return
+        per_replica = self.per_replica_world_size
+        if per_replica % self.nnodes_per_replica != 0:
+            raise ValueError(
+                f"per_replica_world_size ({per_replica}) must be divisible by nnodes_per_replica "
+                f"({self.nnodes_per_replica}) for teacher {self.key!r}."
+            )
+        gpus_per_replica_node = per_replica // self.nnodes_per_replica
+        if gpus_per_replica_node > n_gpus_per_node:
+            raise ValueError(
+                f"gpus_per_replica_node ({gpus_per_replica_node} = per_replica_world_size {per_replica} / "
+                f"nnodes_per_replica {self.nnodes_per_replica}) must not exceed the teacher pool's "
+                f"n_gpus_per_node ({n_gpus_per_node}) for teacher {self.key!r}."
+            )
 
     def validate_and_prepare_for_distillation(self, use_topk: bool, topk: Optional[int]) -> None:
         # Prompt + Response from student are fed into teacher as context
@@ -277,6 +309,7 @@ class DistillationConfig(BaseConfig):
                 use_topk=self.distillation_loss.loss_settings.use_topk,
                 topk=self.distillation_loss.topk,
             )
+            teacher_model.validate_nnodes_per_replica(self.n_gpus_per_node)
             teacher_world_size_sum += teacher_model.world_size
         total_pool_size = self.n_gpus_per_node * self.nnodes
         if teacher_world_size_sum != total_pool_size:

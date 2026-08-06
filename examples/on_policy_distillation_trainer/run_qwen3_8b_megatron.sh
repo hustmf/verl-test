@@ -13,6 +13,13 @@ NNODES=${NNODES:-1}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 TEACHER_WORLD_SIZE=${TEACHER_WORLD_SIZE:-4}
 
+# Nodes occupied by one teacher inference replica (0 = derived from the pool layout).
+# On Ascend NPU clusters a replica must not span SuperPods (at most 48 nodes each),
+# so this must be <= the teacher-pool node count available within one SuperPod; for
+# zero fragmentation, align distillation.nnodes so each SuperPod's node count is
+# divisible by TEACHER_NNODES_PER_REPLICA.
+TEACHER_NNODES_PER_REPLICA=${TEACHER_NNODES_PER_REPLICA:-0}
+
 distillation_loss_mode=${DISTILLATION_LOSS_MODE:-forward_kl_topk}
 use_policy_gradient=${USE_POLICY_GRADIENT:-False}
 distillation_topk=${DISTILLATION_TOPK:-64}
@@ -109,6 +116,7 @@ EXTRA=(
     distillation.n_gpus_per_node=${TEACHER_WORLD_SIZE}
     distillation.nnodes=${NNODES}
     distillation.teacher_models.teacher_model.model_path="$TEACHER_MODEL"
+    distillation.teacher_models.teacher_model.nnodes_per_replica=${TEACHER_NNODES_PER_REPLICA}
     distillation.teacher_models.teacher_model.inference.tensor_model_parallel_size=${teacher_tp}
     distillation.teacher_models.teacher_model.inference.name=vllm
     distillation.teacher_models.teacher_model.inference.gpu_memory_utilization=${teacher_gpu_mem_util}

@@ -29,7 +29,7 @@ import ray
 from cachetools import LRUCache
 from omegaconf import DictConfig
 
-from verl.single_controller.ray.base import RayResourcePool, RayWorkerGroup
+from verl.single_controller.ray.base import RayResourcePool, RayWorkerGroup, validate_replicas_within_superpod
 from verl.utils import normalize_token_ids
 from verl.utils.ray_utils import auto_await
 from verl.utils.rollout_trace import rollout_trace_op
@@ -505,6 +505,25 @@ class LLMServerManager:
             else self.rollout_config.n_gpus_per_node * self.rollout_config.nnodes
         )
         num_replicas = world_size // rollout_world_size
+
+        if self.worker_group and self.rollout_config.name != "trtllm":
+            # Hybrid replicas are contiguous rank slices of the trainer pool; on Ascend
+            # NPU clusters each replica must stay within one SuperPod. No-op off NPU.
+            trainer_pool = getattr(self.worker_group, "resource_pool", None)
+            pool_gpus_per_node = (
+                trainer_pool.store[0] if trainer_pool is not None else self.rollout_config.n_gpus_per_node
+            )
+            replica_nodes = -(-rollout_world_size // pool_gpus_per_node)  # ceil division
+            validate_replicas_within_superpod(
+                pg_spod_ids=getattr(trainer_pool, "pg_spod_ids", None),
+                gpus_per_node=pool_gpus_per_node,
+                replica_world_size=rollout_world_size,
+                error_hint=(
+                    f" Align trainer.nnodes to SuperPod boundaries so the node count of each "
+                    f"SuperPod is divisible by the replica node count ({replica_nodes}), or "
+                    f"adjust rollout TP/DP/PP so a replica fits within one SuperPod."
+                ),
+            )
 
         self.rollout_replicas = [
             self.rollout_replica_class(

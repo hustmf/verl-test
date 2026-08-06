@@ -88,6 +88,10 @@ class RolloutReplica(ABC):
         config: RolloutConfig, full config.
         model_config: DictConfig, model config.
         gpus_per_node: int, number of gpus per node.
+        gpus_per_replica_node: int, optional. Number of GPUs this replica occupies per
+            node. Defaults to `min(gpus_per_node, world_size)`. When set (e.g. derived
+            from a teacher's `nnodes_per_replica`), the replica spans
+            `world_size // gpus_per_replica_node` nodes.
     """
 
     def __init__(
@@ -99,6 +103,7 @@ class RolloutReplica(ABC):
         is_reward_model: bool = False,
         is_teacher_model: bool = False,
         name_suffix: str = "",
+        gpus_per_replica_node: Optional[int] = None,
     ) -> None:
         self.replica_rank = replica_rank
         self.config: RolloutConfig = omega_conf_to_dataclass(config)
@@ -110,7 +115,9 @@ class RolloutReplica(ABC):
             * self.config.pipeline_model_parallel_size
         )
         self.gpus_per_node = gpus_per_node
-        self.gpus_per_replica_node = min(gpus_per_node, self.world_size)
+        self.gpus_per_replica_node = (
+            gpus_per_replica_node if gpus_per_replica_node is not None else min(gpus_per_node, self.world_size)
+        )
         assert self.world_size % self.gpus_per_replica_node == 0, (
             f"world_size {self.world_size} must be divisible by gpus_per_node {self.gpus_per_replica_node}"
         )
