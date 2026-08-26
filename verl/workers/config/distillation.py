@@ -314,8 +314,7 @@ class DistillationConfig(BaseConfig):
         """
         if self.max_awake_teachers is not None and self.max_awake_teachers < 1:
             raise ValueError(
-                f"distillation.max_awake_teachers must be >= 1 when set, "
-                f"but got {self.max_awake_teachers}."
+                f"distillation.max_awake_teachers must be >= 1 when set, but got {self.max_awake_teachers}."
             )
 
         total_pool_size = self.n_gpus_per_node * self.nnodes
